@@ -35,6 +35,12 @@ def parse_args():
         help="Directory to store generated semantic maps.",
     )
     parser.add_argument(
+        "--scene-ids",
+        nargs="*",
+        default=None,
+        help="Optional list of scene IDs to process. If omitted, process all scenes.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite existing semantic map files.",
@@ -49,7 +55,11 @@ def parse_args():
 
 
 def build_semantic_maps(
-    input_root: Path, output_root: Path, overwrite: bool, max_scenes: Optional[int]
+    input_root: Path,
+    output_root: Path,
+    overwrite: bool,
+    max_scenes: Optional[int],
+    scene_ids: Optional[list[str]],
 ) -> None:
     if not input_root.exists():
         raise FileNotFoundError(f"Input root does not exist: {input_root}")
@@ -57,6 +67,20 @@ def build_semantic_maps(
     output_root.mkdir(parents=True, exist_ok=True)
 
     scene_dirs = sorted(p for p in input_root.iterdir() if p.is_dir())
+    if scene_ids is not None:
+        requested_scene_ids = set(scene_ids)
+        scene_dirs = [
+            scene_dir
+            for scene_dir in scene_dirs
+            if scene_dir.name in requested_scene_ids
+        ]
+        missing_scene_ids = sorted(
+            requested_scene_ids - {scene_dir.name for scene_dir in scene_dirs}
+        )
+        for scene_id in missing_scene_ids:
+            print(
+                f"[WARN] Requested scene '{scene_id}' was not found under {input_root}"
+            )
     if max_scenes is not None:
         scene_dirs = scene_dirs[:max_scenes]
     if not scene_dirs:
@@ -75,8 +99,14 @@ def build_semantic_maps(
         occ_json_path = scene_dir / "occupancy.json"
         labels_json_path = scene_dir / "labels.json"
         occ_png_path = scene_dir / "occupancy.png"
-        if not (occ_json_path.is_file() and labels_json_path.is_file() and occ_png_path.is_file()):
-            print(f"[MISSING] {scene_name} lacks occupancy.json / occupancy.png / labels.json.")
+        if not (
+            occ_json_path.is_file()
+            and labels_json_path.is_file()
+            and occ_png_path.is_file()
+        ):
+            print(
+                f"[MISSING] {scene_name} lacks occupancy.json / occupancy.png / labels.json."
+            )
             continue
 
         with occ_json_path.open("r", encoding="utf-8") as f:
@@ -93,7 +123,9 @@ def build_semantic_maps(
         if candidate_walls:
             wall_value = int(
                 candidate_walls[
-                    np.argmax([counts[np.where(pixels == v)[0][0]] for v in candidate_walls])
+                    np.argmax(
+                        [counts[np.where(pixels == v)[0][0]] for v in candidate_walls]
+                    )
                 ]
             )
         else:
@@ -173,8 +205,18 @@ def build_semantic_maps(
             y_top = y_min + (ymax_pix + 1) * scale
             w_box = x_right - x_left
             h_box = y_top - y_bottom
-            bbox_m = [format2(x_left), format2(y_bottom), format2(x_right), format2(y_top)]
-            bbox_xywh_m = [format2(x_left), format2(y_bottom), format2(w_box), format2(h_box)]
+            bbox_m = [
+                format2(x_left),
+                format2(y_bottom),
+                format2(x_right),
+                format2(y_top),
+            ]
+            bbox_xywh_m = [
+                format2(x_left),
+                format2(y_bottom),
+                format2(w_box),
+                format2(h_box),
+            ]
             mask_coords_m = [
                 [format2(y_min + (y + 0.5) * scale), format2(x_min + (x + 0.5) * scale)]
                 for y, x in zip(ys, xs)
@@ -202,7 +244,9 @@ def build_semantic_maps(
         wall_mask_flip = np.flipud(wall_mask)
         visual_map[wall_mask_flip] = wall_cat_id
 
-        wall_label_mask, wall_count = nd_label(wall_mask_flip, structure=np.ones((3, 3), dtype=np.int32))
+        wall_label_mask, wall_count = nd_label(
+            wall_mask_flip, structure=np.ones((3, 3), dtype=np.int32)
+        )
         for idx in range(1, wall_count + 1):
             block_mask = wall_label_mask == idx
             ys, xs = np.where(block_mask)
@@ -216,8 +260,18 @@ def build_semantic_maps(
             y_top = y_min + (ymax_pix + 1) * scale
             w_box = x_right - x_left
             h_box = y_top - y_bottom
-            bbox_m = [format2(x_left), format2(y_bottom), format2(x_right), format2(y_top)]
-            bbox_xywh_m = [format2(x_left), format2(y_bottom), format2(w_box), format2(h_box)]
+            bbox_m = [
+                format2(x_left),
+                format2(y_bottom),
+                format2(x_right),
+                format2(y_top),
+            ]
+            bbox_xywh_m = [
+                format2(x_left),
+                format2(y_bottom),
+                format2(w_box),
+                format2(h_box),
+            ]
             mask_coords_m = [
                 [format2(y_min + (y + 0.5) * scale), format2(x_min + (x + 0.5) * scale)]
                 for y, x in zip(ys, xs)
@@ -296,7 +350,12 @@ def build_semantic_maps(
             json.dump(result_list, f, indent=2)
         print(f"[WRITE] {out_json}")
 
-        extent = [float(x_min), float(x_min) + w * scale, float(y_min), float(y_min) + h * scale]
+        extent = [
+            float(x_min),
+            float(x_min) + w * scale,
+            float(y_min),
+            float(y_min) + h * scale,
+        ]
         plt.figure(figsize=(12, 12))
 
         bg_color = (31 / 255, 119 / 255, 180 / 255, 1.0)  # deep blue
@@ -324,6 +383,7 @@ def main():
         args.output_root.expanduser(),
         args.overwrite,
         args.max_scenes,
+        args.scene_ids,
     )
 
 

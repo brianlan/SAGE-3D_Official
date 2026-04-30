@@ -45,9 +45,11 @@ splat-transform /ssd5/datasets/SAGE3D/InteriorGS/0002_839955/3dgs_compressed.ply
 ### Step 2: Original PLY → USDZ
 
 ```bash
-python Code/data_pipeline/interiorgs_processing/sage_ply_to_usdz.py \
-    /tmp/sage_ply/<scene_id>.ply \
-    --output_file /ssd5/datasets/SAGE3D/InteriorGS_usdz/<scene_id>.usdz
+cd /ssd4/github-knowledge-base/3dgrut && \
+    PATH="/ssd4/github-knowledge-base/3dgrut/.venv/bin:$PATH" \
+    .venv/bin/python -m threedgrut.export.scripts.ply_to_usd \
+        /tmp/sage_ply/<scene_id>.ply \
+        --output_file /ssd5/datasets/SAGE3D/InteriorGS_usdz/<scene_id>.usdz
 ```
 
 If conversion succeeds, remove the temporary PLY:

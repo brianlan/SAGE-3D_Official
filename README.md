@@ -811,14 +811,12 @@ Test exploration and collision avoidance without explicit goals:
 If you find this work useful for your research, please cite our paper:
 
 ```bibtex
-@misc{miao2025physicallyexecutable3dgaussian,
-      title={Towards Physically Executable 3D Gaussian for Embodied Navigation}, 
-      author={Bingchen Miao and Rong Wei and Zhiqi Ge and Xiaoquan sun and Shiqi Gao and Jingzhe Zhu and Renhan Wang and Siliang Tang and Jun Xiao and Rui Tang and Juncheng Li},
-      year={2025},
-      eprint={2510.21307},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2510.21307}, 
+@inproceedings{miao2026towards,
+  title = {Towards Physically Executable {3D} Gaussian for Embodied Navigation},
+  author = {Miao, Bingchen and Wei, Rong and Ge, Zhiqi and Sun, Xiaoquan and Gao, Shiqi and Zhu, Jingzhe and Wang, Renhan and Tang, Siliang and Xiao, Jun and Tang, Rui and Li, Juncheng},
+  booktitle = {The Fourteenth International Conference on Learning Representations},
+  year = {2026},
+  url = {https://openreview.net/forum?id=HB6KvsqcAn}
 }
 ```
 

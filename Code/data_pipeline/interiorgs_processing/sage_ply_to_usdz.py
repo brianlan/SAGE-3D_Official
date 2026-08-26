@@ -330,6 +330,11 @@ def read_ply_as_gaussians(ply_path: str, max_sh_degree: int = 3):
     if len(extra_f_names) > 0:
         for idx, attr_name in enumerate(extra_f_names[:num_specular]):
             features_specular[:, idx] = np.asarray(vertex[attr_name])
+        # PLY stores f_rest channel-major [R bases, G bases, B bases]; NuRec
+        # features_specular must be feature-major [basis RGB]. Same transform
+        # as the NVIDIA 3DGRUT PLY importer.
+        features_specular = features_specular.reshape(num_gaussians, 3, -1)
+        features_specular = features_specular.transpose(0, 2, 1).reshape(num_gaussians, -1)
 
     # Rotation (quaternion, wxyz order in PLY: rot_0=w, rot_1=x, rot_2=y, rot_3=z)
     rotations = np.zeros((num_gaussians, 4), dtype=np.float32)

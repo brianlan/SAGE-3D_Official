@@ -6,10 +6,11 @@ Sequential, fail-fast pipeline:
   1. splat-transform        InteriorGS compressed PLY -> temporary PLY
   2. sage_ply_to_usdz.py    temporary PLY -> USDZ
   3. filter_usdz_by_z.py    USDZ -> Z-filtered USDZ
-  4. sage3d_usda_builder.py filtered USDZ + original collision -> final USDA
+  4. sanitize_collision_usd.py raw collision -> sanitized collision + report
+  5. sage3d_usda_builder.py filtered visual + sanitized collision -> final USDA
 
-The final USDA references the filtered visual USDZ and the original,
-unfiltered collision mesh. Existing final USDA files are preserved unless
+The final USDA references the filtered visual USDZ and the sanitized collision
+mesh. Existing final USDA files are preserved unless
 --overwrite is given.
 """
 
@@ -30,6 +31,7 @@ INTERIORGS_ROOT = Path("/ssd5/datasets/SAGE3D/InteriorGS")
 USDZ_DIR = Path("/ssd5/datasets/SAGE3D/InteriorGS_usdz_from_ply")
 FILTERED_ROOT = Path("/ssd5/datasets/SAGE3D/Filtered_By_Z")
 COLLISION_DIR = Path("/ssd5/datasets/SAGE3D/Collision_Mesh/Collision_Mesh")
+SANITIZED_COLLISION_DIR = Path("/ssd5/datasets/SAGE3D/Collision_Mesh_Sanitized")
 OUT_DIR = Path("/ssd5/datasets/SAGE3D/InteriorGS_CollisionMesh_usda")
 TMP_PLY_DIR = Path("/tmp/sage_ply")
 
@@ -53,6 +55,8 @@ def compute_paths(scene_id: str, max_z: float) -> dict:
         "work_dir": work_dir,
         "filtered_usdz": work_dir / f"{scene_id}.usdz",
         "collision": COLLISION_DIR / scene_id / f"{scene_id}_collision.usd",
+        "sanitized_collision": SANITIZED_COLLISION_DIR / scene_id / f"{scene_id}_collision.usd",
+        "sanitize_report": SANITIZED_COLLISION_DIR / scene_id / f"{scene_id}_collision.sanitize.json",
         "generated_usda": work_dir / f"{scene_id}.usda",
         "final_usda": OUT_DIR / f"{scene_id}_z{max_z}.usda",
     }
@@ -119,6 +123,12 @@ def main(argv=None) -> None:
         f"Filter USDZ gaussians by Z <= {max_z}",
     )
     run(
+        [DATA_PY, str(SCRIPT_DIR / "sanitize_collision_usd.py"),
+         str(paths["collision"]), "--output", str(paths["sanitized_collision"]),
+         "--report", str(paths["sanitize_report"])],
+        "Remove supported thin collision overlays",
+    )
+    run(
         [DATA_PY, str(BUILDER),
          "--usdz-dir", str(paths["work_dir"]),
          "--out-dir", str(paths["work_dir"]),
@@ -126,7 +136,7 @@ def main(argv=None) -> None:
          "--usdz-placeholder", "@usdz_root[gauss.usda]@",
          "--usdz-path-template", f"{paths['filtered_usdz']}[gauss.usda]",
          "--collision-placeholder", "@collision_root@",
-         "--collision-path-template", str(paths["collision"]),
+         "--collision-path-template", str(paths["sanitized_collision"]),
          "--overwrite"],
         "Build USDA wrapper",
     )

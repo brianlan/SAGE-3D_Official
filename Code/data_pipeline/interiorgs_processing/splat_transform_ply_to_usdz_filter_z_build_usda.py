@@ -24,15 +24,7 @@ REPO_ROOT = SCRIPT_DIR.parent.parent.parent
 BUILDER = REPO_ROOT / "Code" / "benchmark" / "scene_data" / "sage3d_usda_builder.py"
 TEMPLATE_PATH = REPO_ROOT / "Data" / "template.usda"
 
-# Interpreter for data-prep subprocesses (msgpack / numpy / pxr live here).
-DATA_PY = "/ssd4/envs/vln_data_prep_py311/bin/python"
-
-INTERIORGS_ROOT = Path("/ssd5/datasets/SAGE3D/InteriorGS")
-USDZ_DIR = Path("/ssd5/datasets/SAGE3D/InteriorGS_usdz_from_ply")
-FILTERED_ROOT = Path("/ssd5/datasets/SAGE3D/Filtered_By_Z")
-COLLISION_DIR = Path("/ssd5/datasets/SAGE3D/Collision_Mesh/Collision_Mesh")
-SANITIZED_COLLISION_DIR = Path("/ssd5/datasets/SAGE3D/Collision_Mesh_Sanitized")
-OUT_DIR = Path("/ssd5/datasets/SAGE3D/InteriorGS_CollisionMesh_usda")
+DEFAULT_DATA_ROOT = Path("/ssd5/datasets/SAGE3D")
 TMP_PLY_DIR = Path("/tmp/sage_ply")
 
 
@@ -46,19 +38,21 @@ def find_source_ply(scene_id: str, input_root: Path) -> Path:
     return matches[0]
 
 
-def compute_paths(scene_id: str, max_z: float) -> dict:
+def compute_paths(scene_id: str, max_z: float, data_root: Path) -> dict:
     """All input/output paths for one scene build (no filesystem access)."""
-    work_dir = FILTERED_ROOT / f"{scene_id}_z{max_z}"
+    work_dir = data_root / "Filtered_By_Z" / f"{scene_id}_z{max_z}"
+    collision_dir = data_root / "Collision_Mesh" / "Collision_Mesh"
+    sanitized_dir = data_root / "Collision_Mesh_Sanitized"
     return {
         "tmp_ply": TMP_PLY_DIR / f"{scene_id}.ply",
-        "usdz": USDZ_DIR / f"{scene_id}.usdz",
+        "usdz": data_root / "InteriorGS_usdz_from_ply" / f"{scene_id}.usdz",
         "work_dir": work_dir,
         "filtered_usdz": work_dir / f"{scene_id}.usdz",
-        "collision": COLLISION_DIR / scene_id / f"{scene_id}_collision.usd",
-        "sanitized_collision": SANITIZED_COLLISION_DIR / scene_id / f"{scene_id}_collision.usd",
-        "sanitize_report": SANITIZED_COLLISION_DIR / scene_id / f"{scene_id}_collision.sanitize.json",
+        "collision": collision_dir / scene_id / f"{scene_id}_collision.usd",
+        "sanitized_collision": sanitized_dir / scene_id / f"{scene_id}_collision.usd",
+        "sanitize_report": sanitized_dir / scene_id / f"{scene_id}_collision.sanitize.json",
         "generated_usda": work_dir / f"{scene_id}.usda",
-        "final_usda": OUT_DIR / f"{scene_id}_z{max_z}.usda",
+        "final_usda": data_root / "InteriorGS_CollisionMesh_usda" / f"{scene_id}_z{max_z}.usda",
     }
 
 
@@ -80,8 +74,19 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--input-root",
         type=Path,
-        default=INTERIORGS_ROOT,
-        help="Root of InteriorGS scene folders (default: /ssd5/datasets/SAGE3D/InteriorGS)",
+        default=None,
+        help="Root of InteriorGS scene folders (default: <data-root>/InteriorGS)",
+    )
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=DEFAULT_DATA_ROOT,
+        help=f"Root of all SAGE3D data (default: {DEFAULT_DATA_ROOT})",
+    )
+    parser.add_argument(
+        "--data-py",
+        default=sys.executable,
+        help="Python interpreter for subprocesses with msgpack/numpy/pxr (default: current interpreter)",
     )
     parser.add_argument("--max-z", type=float, default=2.75, help="Z threshold (keep Z <= max-z)")
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing final USDA")
@@ -92,8 +97,9 @@ def main(argv=None) -> None:
     args = parse_args(argv)
     scene_id = args.scene_id
     max_z = args.max_z
-    source_ply = args.source_ply or find_source_ply(scene_id, args.input_root)
-    paths = compute_paths(scene_id, max_z)
+    input_root = args.input_root or args.data_root / "InteriorGS"
+    source_ply = args.source_ply or find_source_ply(scene_id, input_root)
+    paths = compute_paths(scene_id, max_z, args.data_root)
 
     if not source_ply.exists():
         sys.exit(f"[ERROR] Source PLY not found: {source_ply}")
@@ -111,25 +117,25 @@ def main(argv=None) -> None:
         "Decompress compressed PLY",
     )
     run(
-        [DATA_PY, str(SCRIPT_DIR / "sage_ply_to_usdz.py"),
+        [args.data_py, str(SCRIPT_DIR / "sage_ply_to_usdz.py"),
          str(paths["tmp_ply"]), "--output_file", str(paths["usdz"])],
         "Convert PLY to USDZ",
     )
     paths["tmp_ply"].unlink(missing_ok=True)
     run(
-        [DATA_PY, str(SCRIPT_DIR / "filter_usdz_by_z.py"),
+        [args.data_py, str(SCRIPT_DIR / "filter_usdz_by_z.py"),
          str(paths["usdz"]), "--output", str(paths["filtered_usdz"]),
          "--z-threshold", str(max_z)],
         f"Filter USDZ gaussians by Z <= {max_z}",
     )
     run(
-        [DATA_PY, str(SCRIPT_DIR / "sanitize_collision_usd.py"),
+        [args.data_py, str(SCRIPT_DIR / "sanitize_collision_usd.py"),
          str(paths["collision"]), "--output", str(paths["sanitized_collision"]),
          "--report", str(paths["sanitize_report"])],
         "Remove supported thin collision overlays",
     )
     run(
-        [DATA_PY, str(BUILDER),
+        [args.data_py, str(BUILDER),
          "--usdz-dir", str(paths["work_dir"]),
          "--out-dir", str(paths["work_dir"]),
          "--template", str(TEMPLATE_PATH),

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Remove thin, supported floor overlays from a collision USD.
 
-The decision is made per Mesh prim in world coordinates.  A prim is removed
-only when it is thin, predominantly horizontal, and deterministic samples of
-its triangle areas are supported from below by the ``/Root/SM_floorplan`` mesh
-within the configured gap.  Raw USD is never modified.
+The v1 policy removes thin horizontal prims supported by SM_floorplan. Opt-in
+v2 preserves those removals and adds source-bound, explicitly approved prims
+passing ground-relative thickness, contact and support checks. Shape ratios
+are diagnostic for approved v2 instances. Raw USD is never modified.
 """
 
 from __future__ import annotations
@@ -17,9 +17,13 @@ import os
 from pathlib import Path
 
 import numpy as np
-from pxr import Usd, UsdGeom
+from pxr import Sdf, Usd, UsdGeom
 
 POLICY_ID = "sage3d.thin_floor_overlay.v1"
+POLICY_V2 = "sage3d.thin_floor_overlay.v2"
+V2_THRESHOLDS = {"max_overlay_thickness_m": .020, "max_top_above_ground_m": .025,
+                 "max_contact_gap_m": .005, "max_support_gap_m": .025,
+                 "min_support_coverage": .95, "review_thickness_over_short_side": .05}
 DEFAULTS = {
     "max_overlay_thickness_m": 0.005,
     "min_horizontal_area_ratio": 0.99,
@@ -202,7 +206,43 @@ def _support_metrics(triangles: np.ndarray, index: _FloorSupportIndex, max_gap: 
         "support_floor_height_max_m": float(support_heights.max())
         if support_heights.size
         else None,
+        "minimum_contact_gap_m": float(np.maximum(gaps[np.isfinite(gaps) & (gaps >= -_EPS)], 0).min())
+        if np.any(np.isfinite(gaps) & (gaps >= -_EPS)) else None,
     }
+
+
+def _geometry_sha256(points, faces):
+    return hashlib.sha256(points.astype("<f8").tobytes() + faces.astype("<i8").tobytes()).hexdigest()
+
+
+def _v2_reasons(mesh, points, metrics, support_index, ground_z):
+    import trimesh
+    from scipy.spatial import QhullError
+
+    triangles = _triangles(mesh, points)
+    if triangles is None or not len(triangles) or not np.isfinite(points).all() or metrics["area_m2"] <= _EPS:
+        return ["invalid_or_nontriangular_geometry"]
+    try:
+        _, extents = trimesh.bounds.oriented_bounds_2D(points[:, :2])
+    except QhullError:
+        return ["degenerate_xy_footprint"]
+    short_side = float(min(extents))
+    metrics.update(_support_metrics(triangles, support_index, V2_THRESHOLDS["max_support_gap_m"]))
+    metrics.update(short_xy_side_m=short_side,
+                   thickness_over_short_side=float(metrics["thickness_m"] / short_side),
+                   sheet_shape_warning=bool(metrics["thickness_m"] / short_side > V2_THRESHOLDS["review_thickness_over_short_side"] + _EPS),
+                   bottom_above_ground_m=float(points[:, 2].min() - ground_z),
+                   top_above_ground_m=float(points[:, 2].max() - ground_z))
+    contact = metrics["minimum_contact_gap_m"]
+    checks = {
+        "too_thick": metrics["thickness_m"] <= V2_THRESHOLDS["max_overlay_thickness_m"] + _EPS,
+        "below_ground": metrics["bottom_above_ground_m"] >= -_EPS,
+        "too_high": metrics["top_above_ground_m"] <= V2_THRESHOLDS["max_top_above_ground_m"] + _EPS,
+        "support_coverage_below_threshold": metrics["support_coverage"] >= V2_THRESHOLDS["min_support_coverage"],
+        "support_contact_gap_above_limit": contact is not None and contact <= V2_THRESHOLDS["max_contact_gap_m"] + _EPS,
+        "contains_child_prims": not list(mesh.GetPrim().GetAllChildren()),
+    }
+    return [name for name, passed in checks.items() if not passed]
 
 
 def _validate_thresholds(thresholds: dict[str, float]) -> None:
@@ -244,6 +284,9 @@ def sanitize_collision_usd(
     max_support_gap_m: float = DEFAULTS["max_support_gap_m"],
     min_support_coverage: float = DEFAULTS["min_support_coverage"],
     max_floor_height_m: float = DEFAULTS["max_floor_height_m"],
+    policy: str = "v1",
+    approved_manifest: Path | None = None,
+    dry_run: bool = False,
 ) -> dict:
     input_path = Path(input_path)
     output_path = Path(output_path)
@@ -259,9 +302,42 @@ def sanitize_collision_usd(
     resolved_paths = {path.resolve() for path in (input_path, output_path, report_path)}
     if len(resolved_paths) != 3:
         raise ValueError("input, output, and report paths must be distinct")
+    if policy not in ("v1", "v2") or (policy == "v1" and approved_manifest is not None):
+        raise ValueError("approved_manifest requires policy v2")
+    source_sha256 = _sha256(input_path)
+    approval_record = None
+    approvals = {}
+    if policy == "v2":
+        if thresholds != DEFAULTS:
+            raise ValueError("policy v2 preserves the default legacy thresholds")
+        if approved_manifest is None:
+            raise ValueError("policy v2 requires an approved manifest")
+        if Path(approved_manifest).resolve() in resolved_paths:
+            raise ValueError("approved manifest must be distinct from input, output and report")
+        manifest = json.loads(Path(approved_manifest).read_text())
+        matching = [record for record in manifest["scenes"].values()
+                    if record["source_sha256"] == source_sha256]
+        if manifest["policy"] != POLICY_V2 or len(matching) != 1:
+            raise ValueError("manifest policy or source SHA256 mismatch")
+        approval_record = matching[0]
+        ground_z = approval_record["ground_z_m"]
+        if ground_z is not None and not math.isfinite(ground_z):
+            raise ValueError("ground datum must be finite")
+        approvals = {entry["path"]: entry for entry in approval_record["approvals"]}
+        if len(approvals) != len(approval_record["approvals"]):
+            raise ValueError("duplicate approval paths")
+        if approvals and ground_z is None:
+            raise ValueError("approved removals require a reliable ground datum")
     stage = Usd.Stage.Open(str(input_path))
     if stage is None:
         raise RuntimeError(f"Could not open collision USD: {input_path}")
+    if policy == "v2" or dry_run:
+        if stage.GetRootLayer().GetExternalReferences():
+            raise ValueError("v2/dry-run requires a self-contained collision USD")
+        # USD caches layers by identifier; edits must not alter another reader's input stage.
+        stage = Usd.Stage.Open(Sdf.Layer.OpenAsAnonymous(str(input_path)))
+    if policy == "v2" and (UsdGeom.GetStageUpAxis(stage) != "Z" or UsdGeom.GetStageMetersPerUnit(stage) != 1.):
+        raise ValueError("policy v2 requires Z-up collision geometry in metres")
     floor_prim = _find_floorplan(stage)
     cache = UsdGeom.XformCache(Usd.TimeCode.Default())
     floor_mesh = UsdGeom.Mesh(floor_prim)
@@ -270,6 +346,22 @@ def sanitize_collision_usd(
     if floor_triangles is None:
         raise RuntimeError("/Root/SM_floorplan must be fully triangulated")
     support_index = _FloorSupportIndex(floor_triangles)
+    v2_support = None
+    if approval_record is not None and approval_record["ground_z_m"] is not None:
+        ground_z = approval_record["ground_z_m"]
+        near = np.abs(floor_triangles[:, :, 2] - ground_z).max(axis=1) <= .01 + _EPS
+        v2_support = _FloorSupportIndex(floor_triangles[near])
+    for path, approval in approvals.items():
+        prim = stage.GetPrimAtPath(path)
+        if not prim or not prim.IsA(UsdGeom.Mesh) or prim == floor_prim:
+            raise ValueError(f"invalid approved Mesh path: {path}")
+        mesh = UsdGeom.Mesh(prim)
+        triangles = _triangles(mesh, _world_points(mesh, cache))
+        if triangles is None:
+            raise ValueError(f"invalid approved geometry: {path}")
+        faces = np.asarray(mesh.GetFaceVertexIndicesAttr().Get(), dtype=np.int64).reshape(-1, 3)
+        if _geometry_sha256(_world_points(mesh, cache), faces) != approval["world_geometry_sha256"]:
+            raise ValueError(f"approved geometry SHA256 mismatch: {path}")
 
     removed = []
     skipped = []
@@ -284,10 +376,15 @@ def sanitize_collision_usd(
         mesh_records.append(metrics)
         if prim == floor_prim or metrics["thickness_m"] is None:
             continue
-        if metrics["thickness_m"] > max_overlay_thickness_m:
+        v2_candidate = (v2_support is not None and metrics["thickness_m"] <= V2_THRESHOLDS["max_overlay_thickness_m"] + _EPS
+                        and points[:, 2].min() >= ground_z - _EPS
+                        and points[:, 2].max() <= ground_z + V2_THRESHOLDS["max_top_above_ground_m"] + _EPS)
+        if metrics["thickness_m"] > max_overlay_thickness_m and not v2_candidate and str(prim.GetPath()) not in approvals:
             continue
         triangles = _triangles(mesh, points)
         reasons = []
+        if metrics["thickness_m"] > max_overlay_thickness_m:
+            reasons.append("thickness_above_legacy_limit")
         if not metrics["geometry_valid"] or triangles is None:
             reasons.append("invalid_or_nontriangular_geometry")
         if metrics["horizontal_area_ratio"] < min_horizontal_area_ratio:
@@ -313,6 +410,17 @@ def sanitize_collision_usd(
         elif support["support_floor_height_max_m"] > max_floor_height_m:
             reasons.append("supporting_floor_above_height_threshold")
         entry = {"path": str(prim.GetPath()), "metrics": metrics}
+        if reasons and policy == "v2" and (v2_candidate or entry["path"] in approvals):
+            reasons = _v2_reasons(mesh, points, metrics, v2_support, ground_z)
+            if entry["path"] not in approvals:
+                reasons.append("instance_not_approved")
+            elif reasons:
+                raise ValueError(f"approved instance failed v2 geometry: {entry['path']}: {reasons}")
+            entry["deletion_rule"] = "approved_v2"
+        elif not reasons and policy == "v2":
+            if list(prim.GetAllChildren()):
+                raise ValueError(f"legacy removal contains child prims: {entry['path']}")
+            entry["deletion_rule"] = "legacy_v1"
         if reasons:
             entry["reasons"] = reasons
             skipped.append(entry)
@@ -320,6 +428,10 @@ def sanitize_collision_usd(
             remove_paths.append(prim.GetPath())
             removed.append(entry)
 
+    if not set(approvals) <= {str(path) for path in remove_paths}:
+        raise ValueError("not every approved instance was selected")
+    if _sha256(input_path) != source_sha256:
+        raise ValueError("input USD changed during sanitization")
     for path in remove_paths:
         stage.RemovePrim(path)
 
@@ -330,9 +442,9 @@ def sanitize_collision_usd(
         len(UsdGeom.Mesh(prim).GetFaceVertexCountsAttr().Get()) for prim in output_meshes
     )
     report = {
-        "policy": POLICY_ID,
+        "policy": POLICY_V2 if policy == "v2" else POLICY_ID,
         "source_path": str(input_path),
-        "source_sha256": _sha256(input_path),
+        "source_sha256": source_sha256,
         "thresholds": thresholds,
         "removed_prims": removed,
         "skipped_candidates": skipped,
@@ -341,17 +453,25 @@ def sanitize_collision_usd(
         "input_face_count": input_face_count,
         "output_face_count": output_face_count,
     }
+    if policy == "v2":
+        report.update(v2_thresholds=V2_THRESHOLDS, ground_z_m=approval_record["ground_z_m"],
+                      approved_manifest_sha256=_sha256(Path(approved_manifest)),
+                      v2_shape_ratios_are_diagnostics=True)
+    report["dry_run"] = dry_run
+    report["sanitizer_sha256"] = _sha256(Path(__file__))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     output_tmp = output_path.with_name(f".{output_path.name}.tmp-{os.getpid()}")
     report_tmp = report_path.with_name(f".{report_path.name}.tmp-{os.getpid()}")
     try:
-        stage.Export(str(output_tmp))
+        if not dry_run:
+            stage.Export(str(output_tmp), args={"format": "usdc"} if policy == "v2" else {})
         with report_tmp.open("w", encoding="utf-8") as file:
             json.dump(report, file, indent=2, sort_keys=True)
             file.write("\n")
-        os.replace(output_tmp, output_path)
+        if not dry_run:
+            os.replace(output_tmp, output_path)
         os.replace(report_tmp, report_path)
     finally:
         output_tmp.unlink(missing_ok=True)
@@ -361,7 +481,8 @@ def sanitize_collision_usd(
         f"faces={input_face_count}, removed={len(removed)}, "
         f"output_meshes={len(output_meshes)}"
     )
-    print(f"[OK] Wrote sanitized collision USD: {output_path}")
+    if not dry_run:
+        print(f"[OK] Wrote sanitized collision USD: {output_path}")
     print(f"[OK] Wrote sanitation report: {report_path}")
     return report
 
@@ -371,6 +492,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("input", type=Path, help="Raw collision USD")
     parser.add_argument("--output", type=Path, required=True, help="Sanitized collision USD")
     parser.add_argument("--report", type=Path, required=True, help="JSON sanitation report")
+    parser.add_argument("--policy", choices=("v1", "v2"), default="v1")
+    parser.add_argument("--approved-manifest", type=Path)
+    parser.add_argument("--dry-run", action="store_true")
     for name, default in DEFAULTS.items():
         parser.add_argument(f"--{name.replace('_', '-')}", type=float, default=default)
     return parser.parse_args(argv)
@@ -387,6 +511,9 @@ def main(argv=None) -> None:
         max_support_gap_m=args.max_support_gap_m,
         min_support_coverage=args.min_support_coverage,
         max_floor_height_m=args.max_floor_height_m,
+        policy=args.policy,
+        approved_manifest=args.approved_manifest,
+        dry_run=args.dry_run,
     )
 
 

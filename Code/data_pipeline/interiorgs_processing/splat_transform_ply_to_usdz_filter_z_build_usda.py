@@ -17,6 +17,7 @@ mesh. Existing final USDA files are preserved unless
 import argparse
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -38,11 +39,15 @@ def find_source_ply(scene_id: str, input_root: Path) -> Path:
     return matches[0]
 
 
-def compute_paths(scene_id: str, max_z: float, data_root: Path) -> dict:
-    """All input/output paths for one scene build (no filesystem access)."""
+def compute_paths(scene_id: str, max_z: float, data_root: Path, *,
+                  sanitized_collision_root: Path | None = None,
+                  final_usda_root: Path | None = None) -> dict:
+    """Absolute input/output paths, keeping asset references valid after relocation."""
+    data_root = data_root.resolve()
     work_dir = data_root / "Filtered_By_Z" / f"{scene_id}_z{max_z}"
     collision_dir = data_root / "Collision_Mesh" / "Collision_Mesh"
-    sanitized_dir = data_root / "Collision_Mesh_Sanitized"
+    sanitized_dir = (sanitized_collision_root or data_root / "Collision_Mesh_Sanitized").resolve()
+    final_dir = (final_usda_root or data_root / "InteriorGS_CollisionMesh_usda").resolve()
     return {
         "tmp_ply": TMP_PLY_DIR / f"{scene_id}.ply",
         "usdz": data_root / "InteriorGS_usdz_from_ply" / f"{scene_id}.usdz",
@@ -52,7 +57,7 @@ def compute_paths(scene_id: str, max_z: float, data_root: Path) -> dict:
         "sanitized_collision": sanitized_dir / scene_id / f"{scene_id}_collision.usd",
         "sanitize_report": sanitized_dir / scene_id / f"{scene_id}_collision.sanitize.json",
         "generated_usda": work_dir / f"{scene_id}.usda",
-        "final_usda": data_root / "InteriorGS_CollisionMesh_usda" / f"{scene_id}_z{max_z}.usda",
+        "final_usda": final_dir / f"{scene_id}_z{max_z}.usda",
     }
 
 
@@ -90,16 +95,29 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument("--max-z", type=float, default=2.75, help="Z threshold (keep Z <= max-z)")
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing final USDA")
-    return parser.parse_args(argv)
+    parser.add_argument("--collision-policy", choices=("v1", "v2"), default="v1")
+    parser.add_argument("--approved-manifest", type=Path, help="Reviewed collision-removal manifest for v2")
+    parser.add_argument("--sanitized-collision-root", type=Path, help="Override sanitized collision output root")
+    parser.add_argument("--final-usda-root", type=Path, help="Override final scene USDA output root")
+    args = parser.parse_args(argv)
+    if args.collision_policy == "v2" and args.approved_manifest is None:
+        parser.error("--collision-policy v2 requires --approved-manifest")
+    if args.collision_policy == "v1" and args.approved_manifest is not None:
+        parser.error("--approved-manifest requires --collision-policy v2")
+    return args
 
 
 def main(argv=None) -> None:
     args = parse_args(argv)
+    if args.approved_manifest is not None and not args.approved_manifest.is_file():
+        sys.exit(f"[ERROR] Approved collision manifest not found: {args.approved_manifest}")
     scene_id = args.scene_id
     max_z = args.max_z
     input_root = args.input_root or args.data_root / "InteriorGS"
     source_ply = args.source_ply or find_source_ply(scene_id, input_root)
-    paths = compute_paths(scene_id, max_z, args.data_root)
+    paths = compute_paths(scene_id, max_z, args.data_root,
+                          sanitized_collision_root=args.sanitized_collision_root,
+                          final_usda_root=args.final_usda_root)
 
     if not source_ply.exists():
         sys.exit(f"[ERROR] Source PLY not found: {source_ply}")
@@ -128,12 +146,12 @@ def main(argv=None) -> None:
          "--z-threshold", str(max_z)],
         f"Filter USDZ gaussians by Z <= {max_z}",
     )
-    run(
-        [args.data_py, str(SCRIPT_DIR / "sanitize_collision_usd.py"),
-         str(paths["collision"]), "--output", str(paths["sanitized_collision"]),
-         "--report", str(paths["sanitize_report"])],
-        "Remove supported thin collision overlays",
-    )
+    sanitize_command = [args.data_py, str(SCRIPT_DIR / "sanitize_collision_usd.py"),
+                        str(paths["collision"]), "--output", str(paths["sanitized_collision"]),
+                        "--report", str(paths["sanitize_report"])]
+    if args.collision_policy == "v2":
+        sanitize_command += ["--policy", "v2", "--approved-manifest", str(args.approved_manifest)]
+    run(sanitize_command, "Remove supported thin collision overlays")
     run(
         [args.data_py, str(BUILDER),
          "--usdz-dir", str(paths["work_dir"]),
@@ -156,10 +174,15 @@ def main(argv=None) -> None:
     if old_token not in content:
         sys.exit(f"[ERROR] Expected authoring_layer token not found in {generated}: {old_token}")
     content = content.replace(old_token, new_token)
-    generated.write_text(content, encoding="utf-8")
-    paths["final_usda"].parent.mkdir(parents=True, exist_ok=True)
-    generated.rename(paths["final_usda"])
-    print(f"[OK] Final USDA: {paths['final_usda']}")
+    final = paths["final_usda"]
+    final.parent.mkdir(parents=True, exist_ok=True)
+    # Stage on the destination disk so replacement stays atomic across output disks.
+    with tempfile.TemporaryDirectory(dir=final.parent) as td:
+        staged = Path(td) / final.name
+        staged.write_text(content, encoding="utf-8")
+        staged.replace(final)
+    generated.unlink()
+    print(f"[OK] Final USDA: {final}")
 
 
 if __name__ == "__main__":

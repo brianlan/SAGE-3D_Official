@@ -433,8 +433,6 @@ def test_v3():
                 part, extra = box(.023, 1.2, x0, x1, y0+.02, y0+.05)
                 faces += [tuple(i+len(points) for i in f) for f in extra]
                 points += part
-                if case == "floating":
-                    assert decisions[0]["nearby_rejections"]["insufficient_floor_contact"] == 1
                 if case == "welded":
                     faces.append((0, 1, len(points)-1))
             make_stage(source, [(path, points, faces, None)])

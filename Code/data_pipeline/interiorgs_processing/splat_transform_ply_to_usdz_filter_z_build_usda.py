@@ -95,13 +95,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument("--max-z", type=float, default=2.75, help="Z threshold (keep Z <= max-z)")
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing final USDA")
-    parser.add_argument("--collision-policy", choices=("v1", "v2"), default="v1")
-    parser.add_argument("--approved-manifest", type=Path, help="Reviewed collision-removal manifest for v2")
+    parser.add_argument("--collision-policy", choices=("v1", "v2", "v3"), default="v1")
+    parser.add_argument("--approved-manifest", type=Path, help="Reviewed collision-removal manifest for v2/v3")
     parser.add_argument("--sanitized-collision-root", type=Path, help="Override sanitized collision output root")
     parser.add_argument("--final-usda-root", type=Path, help="Override final scene USDA output root")
     args = parser.parse_args(argv)
-    if args.collision_policy == "v2" and args.approved_manifest is None:
-        parser.error("--collision-policy v2 requires --approved-manifest")
+    if args.collision_policy in ("v2", "v3") and args.approved_manifest is None:
+        parser.error(f"--collision-policy {args.collision_policy} requires --approved-manifest")
     if args.collision_policy == "v1" and args.approved_manifest is not None:
         parser.error("--approved-manifest requires --collision-policy v2")
     return args
@@ -115,6 +115,9 @@ def main(argv=None) -> None:
     max_z = args.max_z
     input_root = args.input_root or args.data_root / "InteriorGS"
     source_ply = args.source_ply or find_source_ply(scene_id, input_root)
+    if args.collision_policy == "v3":
+        args.sanitized_collision_root = args.sanitized_collision_root or args.data_root / "Collision_Mesh_Sanitized_v3"
+        args.final_usda_root = args.final_usda_root or args.data_root / "InteriorGS_CollisionMesh_usda_v3"
     paths = compute_paths(scene_id, max_z, args.data_root,
                           sanitized_collision_root=args.sanitized_collision_root,
                           final_usda_root=args.final_usda_root)
@@ -149,8 +152,10 @@ def main(argv=None) -> None:
     sanitize_command = [args.data_py, str(SCRIPT_DIR / "sanitize_collision_usd.py"),
                         str(paths["collision"]), "--output", str(paths["sanitized_collision"]),
                         "--report", str(paths["sanitize_report"])]
-    if args.collision_policy == "v2":
-        sanitize_command += ["--policy", "v2", "--approved-manifest", str(args.approved_manifest)]
+    if args.collision_policy in ("v2", "v3"):
+        sanitize_command += ["--policy", args.collision_policy, "--approved-manifest", str(args.approved_manifest)]
+    if args.collision_policy == "v3":
+        sanitize_command += ["--interiorgs-scene-dir", str(source_ply.parent)]
     run(sanitize_command, "Remove supported thin collision overlays")
     run(
         [args.data_py, str(BUILDER),

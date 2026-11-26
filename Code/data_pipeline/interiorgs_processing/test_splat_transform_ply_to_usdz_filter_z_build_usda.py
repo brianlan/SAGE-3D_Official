@@ -165,6 +165,14 @@ def test_pipeline():
             assert (final_root / "840133_z2.75.usda").exists()
             assert final.exists()
 
+            prep.main(argv + ["--collision-policy", "v3", "--approved-manifest", str(manifest)])
+            sanitize, build = record[-2:]
+            assert sanitize[sanitize.index("--policy") + 1] == "v3"
+            assert sanitize[sanitize.index("--interiorgs-scene-dir") + 1] == str(src.parent)
+            v3 = root / "Collision_Mesh_Sanitized_v3/840133/840133_collision.usd"
+            assert v3.exists() and build[build.index("--collision-path-template") + 1] == str(v3)
+            assert (root / "InteriorGS_CollisionMesh_usda_v3/840133_z2.75.usda").exists()
+
             # A cross-device rename must not be needed to publish the final file.
             with patch("os.rename", side_effect=OSError(errno.EXDEV, "cross-device link")):
                 prep.main(argv + ["--overwrite"])

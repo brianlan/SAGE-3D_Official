@@ -286,6 +286,7 @@ def sanitize_collision_usd(
     max_floor_height_m: float = DEFAULTS["max_floor_height_m"],
     policy: str = "v1",
     approved_manifest: Path | None = None,
+    interiorgs_scene_dir: Path | None = None,
     dry_run: bool = False,
 ) -> dict:
     input_path = Path(input_path)
@@ -302,12 +303,15 @@ def sanitize_collision_usd(
     resolved_paths = {path.resolve() for path in (input_path, output_path, report_path)}
     if len(resolved_paths) != 3:
         raise ValueError("input, output, and report paths must be distinct")
-    if policy not in ("v1", "v2") or (policy == "v1" and approved_manifest is not None):
+    reviewed = policy in ("v2", "v3")
+    if policy not in ("v1", "v2", "v3") or (policy == "v1" and approved_manifest is not None):
         raise ValueError("approved_manifest requires policy v2")
+    if policy != "v3" and interiorgs_scene_dir is not None:
+        raise ValueError("InteriorGS annotations require policy v3")
     source_sha256 = _sha256(input_path)
     approval_record = None
     approvals = {}
-    if policy == "v2":
+    if reviewed:
         if thresholds != DEFAULTS:
             raise ValueError("policy v2 preserves the default legacy thresholds")
         if approved_manifest is None:
@@ -315,11 +319,11 @@ def sanitize_collision_usd(
         if Path(approved_manifest).resolve() in resolved_paths:
             raise ValueError("approved manifest must be distinct from input, output and report")
         manifest = json.loads(Path(approved_manifest).read_text())
-        matching = [record for record in manifest["scenes"].values()
+        matching = [(scene, record) for scene, record in manifest["scenes"].items()
                     if record["source_sha256"] == source_sha256]
         if manifest["policy"] != POLICY_V2 or len(matching) != 1:
             raise ValueError("manifest policy or source SHA256 mismatch")
-        approval_record = matching[0]
+        scene, approval_record = matching[0]
         ground_z = approval_record["ground_z_m"]
         if ground_z is not None and not math.isfinite(ground_z):
             raise ValueError("ground datum must be finite")
@@ -331,12 +335,12 @@ def sanitize_collision_usd(
     stage = Usd.Stage.Open(str(input_path))
     if stage is None:
         raise RuntimeError(f"Could not open collision USD: {input_path}")
-    if policy == "v2" or dry_run:
+    if reviewed or dry_run:
         if stage.GetRootLayer().GetExternalReferences():
             raise ValueError("v2/dry-run requires a self-contained collision USD")
         # USD caches layers by identifier; edits must not alter another reader's input stage.
         stage = Usd.Stage.Open(Sdf.Layer.OpenAsAnonymous(str(input_path)))
-    if policy == "v2" and (UsdGeom.GetStageUpAxis(stage) != "Z" or UsdGeom.GetStageMetersPerUnit(stage) != 1.):
+    if reviewed and (UsdGeom.GetStageUpAxis(stage) != "Z" or UsdGeom.GetStageMetersPerUnit(stage) != 1.):
         raise ValueError("policy v2 requires Z-up collision geometry in metres")
     floor_prim = _find_floorplan(stage)
     cache = UsdGeom.XformCache(Usd.TimeCode.Default())
@@ -410,14 +414,14 @@ def sanitize_collision_usd(
         elif support["support_floor_height_max_m"] > max_floor_height_m:
             reasons.append("supporting_floor_above_height_threshold")
         entry = {"path": str(prim.GetPath()), "metrics": metrics}
-        if reasons and policy == "v2" and (v2_candidate or entry["path"] in approvals):
+        if reasons and reviewed and (v2_candidate or entry["path"] in approvals):
             reasons = _v2_reasons(mesh, points, metrics, v2_support, ground_z)
             if entry["path"] not in approvals:
                 reasons.append("instance_not_approved")
             elif reasons:
                 raise ValueError(f"approved instance failed v2 geometry: {entry['path']}: {reasons}")
             entry["deletion_rule"] = "approved_v2"
-        elif not reasons and policy == "v2":
+        elif not reasons and reviewed:
             if list(prim.GetAllChildren()):
                 raise ValueError(f"legacy removal contains child prims: {entry['path']}")
             entry["deletion_rule"] = "legacy_v1"
@@ -430,6 +434,22 @@ def sanitize_collision_usd(
 
     if not set(approvals) <= {str(path) for path in remove_paths}:
         raise ValueError("not every approved instance was selected")
+    if policy == "v3":
+        import semantic_collision
+        directory = Path(interiorgs_scene_dir) if interiorgs_scene_dir else None
+        if directory and any((directory / name).resolve() in resolved_paths
+                             for name in ("labels.json", "structure.json")):
+            raise ValueError("Semantic inputs must be distinct from output paths")
+        semantic, edits, whole = semantic_collision.semantic_decisions(
+            stage, cache, scene, directory, ground_z, v2_support,
+            set(map(str, remove_paths)))
+        semantic["implementation_sha256"] = _sha256(Path(semantic_collision.__file__))
+        for path, attributes in edits.items():
+            prim = stage.GetPrimAtPath(path)
+            for name, value in attributes.items():
+                prim.GetAttribute(name).Set(value)
+        remove_paths.extend(whole)
+        removed.extend({"path": path, "deletion_rule": "semantic_v3"} for path in whole)
     if _sha256(input_path) != source_sha256:
         raise ValueError("input USD changed during sanitization")
     for path in remove_paths:
@@ -442,7 +462,7 @@ def sanitize_collision_usd(
         len(UsdGeom.Mesh(prim).GetFaceVertexCountsAttr().Get()) for prim in output_meshes
     )
     report = {
-        "policy": POLICY_V2 if policy == "v2" else POLICY_ID,
+        "policy": "sage3d.thin_floor_overlay.v3" if policy == "v3" else POLICY_V2 if reviewed else POLICY_ID,
         "source_path": str(input_path),
         "source_sha256": source_sha256,
         "thresholds": thresholds,
@@ -453,20 +473,28 @@ def sanitize_collision_usd(
         "input_face_count": input_face_count,
         "output_face_count": output_face_count,
     }
-    if policy == "v2":
+    if reviewed:
         report.update(v2_thresholds=V2_THRESHOLDS, ground_z_m=approval_record["ground_z_m"],
                       approved_manifest_sha256=_sha256(Path(approved_manifest)),
                       v2_shape_ratios_are_diagnostics=True)
+    if policy == "v3":
+        report.update(scene=scene, semantic=semantic)
     report["dry_run"] = dry_run
     report["sanitizer_sha256"] = _sha256(Path(__file__))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     output_tmp = output_path.with_name(f".{output_path.name}.tmp-{os.getpid()}")
+    if policy == "v3":
+        suffix = ".usda" if output_path.suffix == ".usda" else ".usdc"
+        output_tmp = output_tmp.with_name(output_tmp.name + suffix)
     report_tmp = report_path.with_name(f".{report_path.name}.tmp-{os.getpid()}")
     try:
         if not dry_run:
-            stage.Export(str(output_tmp), args={"format": "usdc"} if policy == "v2" else {})
+            if policy == "v3":
+                stage.Flatten(addSourceFileComment=False).Export(str(output_tmp))
+            else:
+                stage.Export(str(output_tmp), args={"format": "usdc"} if reviewed else {})
         with report_tmp.open("w", encoding="utf-8") as file:
             json.dump(report, file, indent=2, sort_keys=True)
             file.write("\n")
@@ -492,8 +520,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("input", type=Path, help="Raw collision USD")
     parser.add_argument("--output", type=Path, required=True, help="Sanitized collision USD")
     parser.add_argument("--report", type=Path, required=True, help="JSON sanitation report")
-    parser.add_argument("--policy", choices=("v1", "v2"), default="v1")
+    parser.add_argument("--policy", choices=("v1", "v2", "v3"), default="v1")
     parser.add_argument("--approved-manifest", type=Path)
+    parser.add_argument("--interiorgs-scene-dir", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     for name, default in DEFAULTS.items():
         parser.add_argument(f"--{name.replace('_', '-')}", type=float, default=default)
@@ -513,6 +542,7 @@ def main(argv=None) -> None:
         max_floor_height_m=args.max_floor_height_m,
         policy=args.policy,
         approved_manifest=args.approved_manifest,
+        interiorgs_scene_dir=args.interiorgs_scene_dir,
         dry_run=args.dry_run,
     )
 

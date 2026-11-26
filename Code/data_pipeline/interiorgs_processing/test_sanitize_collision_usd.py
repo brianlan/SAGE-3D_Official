@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from pxr import Gf, Usd, UsdGeom, Vt
+from pxr import Gf, Sdf, Usd, UsdGeom, Vt
 
 SPEC = importlib.util.spec_from_file_location(
     "sanitize_collision_usd", Path(__file__).with_name("sanitize_collision_usd.py")
@@ -409,7 +409,100 @@ def test_v2_contract_and_concurrent_source_change():
     print("PASS immutable v2 legacy thresholds, unit contract, source race rejection and v1 dry-run isolation")
 
 
+def test_v3():
+    from pxr import UsdPhysics
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        source = root / "raw.usd"
+        scene_dir = root / "scene_123"
+        scene_dir.mkdir()
+        manifest = root / "approval.json"
+        for case in ("door", "raised", "welded", "carpet", "mixed", "floating", "unsupported",
+                     "ambiguous", "unlabelled", "subset"):
+            path = "/Root/Anonymous"
+            carpet = case not in ("door", "raised", "welded")
+            x0, x1, y0, y1 = (-.6, .6, -.5, .5) if carpet else (-.6, .6, 0, .15)
+            if case == "unsupported":
+                x0, x1 = 1.8, 3.
+            z = .01 if case in ("raised", "floating") else .001
+            thick = .012 if case == "floating" else .021 if carpet else .001
+            points, faces = box(z, thick, x0, x1, y0, y1)
+            if case in ("mixed", "door", "raised", "welded", "subset"):
+                # A closed door leaf or table leg directly above the target sheet.
+                part, extra = box(.023, 1.2, x0, x1, y0+.02, y0+.05)
+                faces += [tuple(i+len(points) for i in f) for f in extra]
+                points += part
+                if case == "welded":
+                    faces.append((0, 1, len(points)-1))
+            make_stage(source, [(path, points, faces, None)])
+            stage = Usd.Stage.Open(str(source))
+            UsdGeom.SetStageUpAxis(stage, "Z")
+            UsdGeom.SetStageMetersPerUnit(stage, 1.)
+            mesh = UsdGeom.Mesh(stage.GetPrimAtPath(path))
+            UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
+            mesh.AddTranslateOp().Set((0, 0, 0))
+            mesh.SetNormalsInterpolation("faceVarying")
+            normals = [(0, 0, i+1) for i in range(3*len(faces))]
+            mesh.CreateNormalsAttr(normals)
+            colours = UsdGeom.PrimvarsAPI(mesh).CreatePrimvar("tag", Sdf.ValueTypeNames.IntArray, "uniform")
+            colours.Set([1, 2])
+            colours.SetIndices([i % 2 for i in range(len(faces))])
+            mesh.CreateExtentAttr([np.min(points, axis=0), np.max(points, axis=0)])
+            if case == "subset":
+                UsdGeom.Subset.CreateGeomSubset(mesh, "part", "face", [0])
+            stage.GetRootLayer().Save()
+            del colours, mesh, stage
+            hole = {"type": "DOOR", "thickness": y1-y0, "profile":
+                    [[x1,y0,2], [x0,y0,2], [x0,y0,0], [x1,y0,0]]}
+            corners, _ = box(z, thick, x0, x1, y0, y1)
+            label = {"label": "mat" if case == "unlabelled" else "carpet", "ins_id": "1",
+                     "bounding_box": [dict(zip("xyz", q)) for q in corners]}
+            labels = ([label, dict(label, ins_id="2")] if case == "ambiguous" else [label]) if carpet else []
+            (scene_dir / "structure.json").write_text(json.dumps({"holes": [] if carpet else [hole]}))
+            (scene_dir / "labels.json").write_text(json.dumps(labels))
+            manifest.write_text(json.dumps({"policy": sanitizer.POLICY_V2, "scenes": {"123": {
+                "source_sha256": sanitizer._sha256(source), "ground_z_m": 0., "approvals": []}}}))
+            kwargs = dict(policy="v3", approved_manifest=manifest, interiorgs_scene_dir=scene_dir)
+            output = root / (case+".usd")
+            dry = sanitizer.sanitize_collision_usd(source, output, root / "dry.json", dry_run=True, **kwargs)
+            assert not output.exists()
+            actual = sanitizer.sanitize_collision_usd(source, output, root / "actual.json", **kwargs)
+            assert dry["semantic"] == actual["semantic"]
+            decisions = actual["semantic"]["decisions"]
+            new = Usd.Stage.Open(str(output))
+            result = new.GetPrimAtPath(path)
+            if case in ("mixed", "door"):
+                assert decisions[0]["faces"] == list(range(12)) and decisions[0]["action"] == "remove_faces"
+                assert list(result.GetAttribute("faceVertexCounts").Get()) == [3]*12
+                np.testing.assert_array_equal(result.GetAttribute("normals").Get(), normals[36:])
+                assert list(result.GetAttribute("primvars:tag:indices").Get()) == [0, 1]*6
+                assert list(result.GetAttribute("primvars:tag").Get()) == [1, 2]
+                assert result.HasAPI(UsdPhysics.CollisionAPI)
+                np.testing.assert_allclose(result.GetAttribute("points").Get(), points[8:])
+            elif case == "carpet":
+                assert not result and decisions[0]["action"] == "remove_prim"
+            else:
+                assert result and all("action" not in row for row in decisions), case
+                assert len(result.GetAttribute("faceVertexCounts").Get()) == len(faces)
+                if case == "floating":
+                    assert decisions[0]["nearby_rejections"]["insufficient_floor_contact"] == 1
+                if case == "welded":
+                    assert decisions[0]["nearby_rejections"]["attached_to_taller_geometry"] == 1
+                if case == "ambiguous":
+                    assert all(row["reason"] == "ambiguous_match" for row in decisions)
+            del result, new
+        try:
+            sanitizer.sanitize_collision_usd(source, output, root / "r.json", **dict(kwargs, interiorgs_scene_dir=root))
+        except ValueError as exc:
+            assert "source scene 123" in str(exc)
+        else:
+            raise AssertionError("Wrong InteriorGS scene accepted")
+    print("PASS semantic doors, carpets, negative controls and retained topology")
+
+
 if __name__ == "__main__":
+    test_v3()
     main()
     test_v2()
     test_v2_world_transform_and_approval_guard()
